@@ -112,6 +112,14 @@ return function(mod)
   for _, u in ipairs(ULTRA_RARES) do ULTRA_SET[u.species] = true end
 
   local flyers = {}
+  local sharedActive, sharedAuthority, sharedRevision = false, false, 0
+  local sharedMap, pendingSharedClaim = nil, nil
+  -- The hub leases each map independently. Keeping only the last snapshot's
+  -- map and authority here let an off-screen update pause whichever field was
+  -- actually being rendered. Cache every map; the scalar fields above are
+  -- now strictly the state of the current overworld map.
+  local sharedSnapshots, sharedGhostEntities = {}, {}
+  local sharedGhostClock = 0
   local battleRest = 0
   local lastBump = nil
   local summonFail -- forward: every summon ends in exactly one event
@@ -136,6 +144,63 @@ return function(mod)
     end
   end
 
+  -- Voxel battles save and later restore the overworld entity table. A
+  -- shared snapshot may replace replica objects while that temporary battle
+  -- table is active; restoring the saved table then draws the old objects
+  -- while the `flyers` array updates the new, detached ones. Reconcile by
+  -- identity every sky tick so only the authoritative live objects render.
+  local function reconcileFlyerEntities(ow)
+    if not (ow and ow.entities) then return end
+    local wanted = {}
+    for _, f in ipairs(flyers) do
+      if f and not f.dead then wanted[f] = true end
+    end
+    for i = #ow.entities, 1, -1 do
+      local e = ow.entities[i]
+      if e and e.wildSkiesFlyer == true and not wanted[e] then
+        table.remove(ow.entities, i)
+      end
+    end
+    for _, f in ipairs(flyers) do
+      if f and not f.dead then
+        local found = false
+        for _, e in ipairs(ow.entities) do
+          if e == f then found = true; break end
+        end
+        if not found then table.insert(ow.entities, f) end
+      end
+    end
+  end
+
+  local function mmoExports()
+    local Game = require("src.core.Game")
+    return Game and Game.mods and Game.mods.exports
+      and Game.mods.exports.rby_mmo or nil
+  end
+
+  local function claimShared(f)
+    if not (sharedActive and f and not pendingSharedClaim) then return false end
+    local mmo = mmoExports()
+    if not (mmo and type(mmo.claimSharedSkyField) == "function") then return false end
+    local Game = require("src.core.Game")
+    local map = Game and Game.overworld and Game.overworld.map
+      and Game.overworld.map.id
+    local airborne = false
+    local ff = mod.find("free_fly")
+    local isFlying = ff and ff.exports and ff.exports.isFlying
+    if isFlying then
+      local okFly, value = pcall(isFlying)
+      airborne = okFly and value == true
+    end
+    local ok, claimed = pcall(mmo.claimSharedSkyField, map, f.id)
+    if ok and claimed == true then
+      pendingSharedClaim = { map = map, id = f.id, flyer = f,
+        airborne = airborne }
+      return true
+    end
+    return false
+  end
+
   -- ------- inter-mod API
   -- free_fly (or any mod) can read and consume flyers; this is the
   -- supported seam, so nothing reaches into this mod's internals
@@ -157,7 +222,8 @@ return function(mod)
 
   mod.exports.flyerAt = function(cellX, cellY, radius)
     local f = flyerNear(cellX, cellY, radius)
-    if f then return { species = f.species, level = f.level } end
+    if f then return { id = f.id, species = f.species, level = f.level,
+      altitude = f.alt or 0 } end
   end
 
   -- sprite packs with in-air art can register a source (shared/README
@@ -172,6 +238,7 @@ return function(mod)
   mod.exports.takeFlyer = function(cellX, cellY, radius)
     local f = flyerNear(cellX, cellY, radius)
     if not f then return nil end
+    if sharedActive then claimShared(f); return nil end
     local Game = require("src.core.Game")
     f.dead = true
     detach(Game and Game.overworld, f)
@@ -445,6 +512,7 @@ return function(mod)
     serial = serial + 1
     local self = setmetatable({}, Flyer)
     self.id = "wild_skies_" .. serial
+    self.wildSkiesFlyer = true
     self.sprite = sprite
     self.species = pick.species
     self.level = pick.level or love.math.random(3, 10)
@@ -833,6 +901,332 @@ return function(mod)
            flapPhase(self), false, false
   end
 
+  local function removeFlyer(f)
+    local Game = require("src.core.Game")
+    f.dead = true
+    detach(Game and Game.overworld, f)
+    for i = #flyers, 1, -1 do
+      if flyers[i] == f then table.remove(flyers, i) end
+    end
+  end
+
+  local function sharedReplica(game, ow, row)
+    local sprite, profile = mountFor(game, row.species)
+    if not sprite then return nil end
+    local f = setmetatable({
+      id = row.id, sprite = sprite, species = row.species, level = row.level,
+      wildSkiesFlyer = true,
+      passable = true, bobAmp = profile.bob,
+      scale = Sky.dexScale(game.data, row.species), flap = profile.flap,
+      bold = row.bold == true, px = row.x, py = row.y, alt = row.alt,
+      sharedX = row.x, sharedY = row.y, sharedAlt = row.alt,
+      facing = row.facing, mode = row.mode, t = 1,
+      vx = 0, vy = 0,
+      mapW = ((ow.map.widthCells or (ow.map.width or 10) * 2) * 16),
+      mapH = ((ow.map.heightCells or (ow.map.height or 9) * 2) * 16),
+      sharedReplica = true,
+    }, Flyer)
+    f.cellX, f.cellY = math.floor((f.px + 8) / 16), math.floor((f.py + 8) / 16)
+    return f
+  end
+
+  -- A replica only needs interpolation and drawing fields. When its client
+  -- inherits the lease it must become a complete Flyer before Flyer:tick is
+  -- allowed to touch it; otherwise wings animate while movement either stays
+  -- at zero or faults on missing roam state.
+  local function promoteSharedAuthority(game, f, row)
+    local sprite, profile = mountFor(game, row.species)
+    if not sprite then return false end
+    f.sprite, f.species, f.level = sprite, row.species, row.level
+    f.bobAmp = profile.bob
+    f.scale = Sky.dexScale(game.data, row.species)
+    f.flap = profile.flap / math.max(1, f.scale)
+    f.speed = love.math.random(profile.speed[1], profile.speed[2])
+    f.band = { SKY_BAND[1], SKY_BAND[2] }
+    f.altTarget = math.max(f.band[1], math.min(f.band[2], row.alt or 32))
+    f.roamFor = math.max((f.t or 1) + 16, 20)
+    f.heading = row.facing == "left" and math.pi or 0
+    f.vx, f.vy = math.cos(f.heading) * f.speed,
+                   math.sin(f.heading) * f.speed
+    f.startleT, f.landX, f.landY, f.leaveBy = nil, nil, nil, nil
+    f.summonId, f.summonX, f.summonY, f.summonBy = nil, nil, nil, nil
+    if row.mode == "ground" then
+      f.mode, f.perchAlt, f.groundT = "ground", row.alt or 0, 8
+    elseif row.mode == "rise" then
+      f.mode, f.perchAlt = "rise", row.alt or 0
+    else
+      -- toLand/leave/summon need private destinations that are deliberately
+      -- absent from the wire shape. Resume them as an ordinary roam instead
+      -- of manufacturing a target or letting nil arithmetic stop the field.
+      f.mode, f.perchAlt, f.groundT = "roam", nil, nil
+    end
+    f.sharedReplica = false
+    return true
+  end
+
+  local function syncSharedSkyGhosts()
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    if not (ow and type(ow.neighbors) == "table"
+       and type(ow.ghosts) == "table") then return end
+    for i = #ow.ghosts, 1, -1 do
+      if ow.ghosts[i].wildSkiesSharedGhost then table.remove(ow.ghosts, i) end
+    end
+    local live = {}
+    for _, nb in ipairs(ow.neighbors) do
+      local mapId = nb.map and nb.map.id
+      local snapshot = mapId and sharedSnapshots[mapId]
+      local peers = {}
+      local entries = {}
+      for _, row in ipairs((snapshot and snapshot.spawns) or {}) do
+        local key = mapId .. ":" .. row.id
+        live[key] = true
+        local f = sharedGhostEntities[key]
+        if not f or f.species ~= row.species then
+          f = sharedReplica(Game, { map = nb.map }, row)
+          if f then
+            f.update = function(self)
+              self.t = (self.t or 0) + 1 / 60
+              local k = 0.12
+              self.px = self.px + ((self.sharedX or self.px) - self.px) * k
+              self.py = self.py + ((self.sharedY or self.py) - self.py) * k
+              self.alt = self.alt + ((self.sharedAlt or self.alt) - self.alt) * k
+              self.cellX = math.floor((self.px + 8) / 16)
+              self.cellY = math.floor((self.py + 8) / 16)
+            end
+            sharedGhostEntities[key] = f
+          end
+        end
+        if f then
+          f.sharedX, f.sharedY, f.sharedAlt = row.x, row.y, row.alt
+          f.facing, f.mode, f.bold = row.facing, row.mode, row.bold == true
+          peers[#peers + 1] = f
+          entries[#entries + 1] = f
+        end
+      end
+      for _, f in ipairs(entries) do
+        ow.ghosts[#ow.ghosts + 1] = {
+          npc = f, map = nb.map, ox = nb.ox, oy = nb.oy, peers = peers,
+          wildSkiesSharedGhost = true,
+        }
+      end
+    end
+    for key in pairs(sharedGhostEntities) do
+      if not live[key] then sharedGhostEntities[key] = nil end
+    end
+  end
+
+  local function seedSharedNeighbor(mapId)
+    if sharedSnapshots[mapId] then return sharedSnapshots[mapId] end
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    local neighbor
+    for _, nb in ipairs((ow and ow.neighbors) or {}) do
+      if nb.map and nb.map.id == mapId then neighbor = nb; break end
+    end
+    if not neighbor then return nil end
+    local tod = ow.tod or "DAY"
+    local picks = flyingSlots(Game, mapId, tod)
+    local encDef = Game.data.encounters and Game.data.encounters[mapId]
+    local def = neighbor.map.def
+    local id = tostring(mapId)
+    local town = id:find("_TOWN", 1, true) or id:find("_CITY", 1, true)
+      or id:find("_ISLAND", 1, true) or id:find("_PLATEAU", 1, true)
+    if #picks == 0 and def and (encDef or town) then
+      local pool = tod == "NITE" and AMBIENT_NITE or AMBIENT_DAY
+      for _, species in ipairs(pool) do picks[#picks + 1] = { species = species } end
+    end
+    local snapshot = { domain = "SKY", map = mapId, revision = 0, spawns = {} }
+    if #picks > 0 then
+      local d = density()
+      local forest = def and def.tileset == "FOREST"
+      local count = math.max(1, math.min(forest and 1 or d.cap, 3))
+      local w = math.max(16,
+        (neighbor.map.widthCells or (neighbor.map.width or 10) * 2) * 16)
+      local h = math.max(16,
+        (neighbor.map.heightCells or (neighbor.map.height or 9) * 2) * 16)
+      for _ = 1, count do
+        local pick = picks[love.math.random(#picks)]
+        serial = serial + 1
+        snapshot.spawns[#snapshot.spawns + 1] = {
+          id = "wild_skies_" .. serial, map = mapId,
+          species = pick.species, level = pick.level or love.math.random(3, 8),
+          x = love.math.random(0, math.max(0, w - 16)),
+          y = love.math.random(0, math.max(0, h - 16)),
+          alt = forest and love.math.random(10, 16)
+            or love.math.random(SKY_BAND[1], SKY_BAND[2]),
+          facing = love.math.random() < 0.5 and "left" or "right",
+          mode = "roam", bold = not town and love.math.random() < 0.35,
+        }
+      end
+    end
+    sharedSnapshots[mapId] = snapshot
+    return snapshot
+  end
+
+  local function tickSharedReplica(dt)
+    for _, f in ipairs(flyers) do
+      f.t = (f.t or 0) + dt
+      local k = math.min(1, dt * 7)
+      f.px = f.px + ((f.sharedX or f.px) - f.px) * k
+      f.py = f.py + ((f.sharedY or f.py) - f.py) * k
+      f.alt = f.alt + ((f.sharedAlt or f.alt) - f.alt) * k
+      f.cellX = math.floor((f.px + 8) / 16)
+      f.cellY = math.floor((f.py + 8) / 16)
+    end
+  end
+
+  mod.exports.sharedSkyFieldSnapshot = function(mapId)
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    if not (ow and ow.map) then return nil end
+    if ow.map.id ~= mapId then return seedSharedNeighbor(mapId) end
+    local out = { domain = "SKY", map = mapId,
+      revision = sharedRevision or 0, localAuthority = sharedAuthority,
+      spawns = {} }
+    for _, f in ipairs(flyers) do
+      if not f.dead and not f.summonId then
+        out.spawns[#out.spawns + 1] = {
+          id = f.id, map = mapId, species = f.species, level = f.level or 5,
+          x = math.max(0, math.floor((f.px or 0) + 0.5)),
+          y = math.max(0, math.floor((f.py or 0) + 0.5)),
+          alt = math.max(0, math.floor((f.alt or 0) + 0.5)),
+          facing = f.facing or "right", mode = f.mode or "roam",
+          bold = f.bold == true,
+        }
+      end
+    end
+    table.sort(out.spawns, function(a, b) return a.id < b.id end)
+    sharedSnapshots[mapId] = out
+    return out
+  end
+
+  mod.exports.sharedSkyNeighborMaps = function()
+    local Game = require("src.core.Game")
+    local out = {}
+    for _, nb in ipairs((Game and Game.overworld and Game.overworld.neighbors) or {}) do
+      if nb.map and nb.map.id then out[#out + 1] = nb.map.id end
+    end
+    return out
+  end
+
+  local function applyCurrentSharedSnapshot(snapshot)
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    if not (ow and ow.map and ow.map.id == snapshot.map) then return false end
+    local nextAuthority = snapshot.localAuthority == true
+    local continuedAuthority = sharedActive and sharedAuthority
+      and sharedMap == snapshot.map and nextAuthority
+    sharedActive, sharedAuthority = true, nextAuthority
+    sharedRevision, sharedMap = snapshot.revision or 0, snapshot.map
+    local wanted, byId = {}, {}
+    for _, row in ipairs(snapshot.spawns) do wanted[row.id] = row end
+    for i = #flyers, 1, -1 do
+      local f, row = flyers[i], wanted[flyers[i].id]
+      if not row or row.species ~= f.species then
+        detach(ow, f); table.remove(flyers, i)
+      else
+        byId[f.id] = f
+      end
+    end
+    for _, row in ipairs(snapshot.spawns) do
+      local f = byId[row.id]
+      if not f then
+        f = sharedReplica(Game, ow, row)
+        if f then flyers[#flyers + 1] = f; table.insert(ow.entities, f) end
+      end
+      if f then
+        if nextAuthority then
+          if not continuedAuthority or f.sharedReplica == true then
+            f.px, f.py, f.alt = row.x, row.y, row.alt
+            f.cellX = math.floor((f.px + 8) / 16)
+            f.cellY = math.floor((f.py + 8) / 16)
+            f.facing, f.bold = row.facing, row.bold == true
+            promoteSharedAuthority(Game, f, row)
+          end
+        else
+          f.sharedReplica = true
+          f.sharedX, f.sharedY, f.sharedAlt = row.x, row.y, row.alt
+          f.facing, f.mode, f.bold = row.facing, row.mode, row.bold == true
+        end
+      end
+    end
+    if pendingSharedClaim and not wanted[pendingSharedClaim.id] then
+      pendingSharedClaim = nil
+    end
+    reconcileFlyerEntities(ow)
+    syncSharedSkyGhosts()
+    return true
+  end
+
+  mod.exports.applySharedSkyFieldSnapshot = function(snapshot)
+    if type(snapshot) ~= "table" or snapshot.domain ~= "SKY"
+       or type(snapshot.spawns) ~= "table" then return false end
+    sharedSnapshots[snapshot.map] = snapshot
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    if not (ow and ow.map and ow.map.id == snapshot.map) then
+      syncSharedSkyGhosts()
+      return true
+    end
+    applyCurrentSharedSnapshot(snapshot)
+    return true
+  end
+
+  mod.exports.removeSharedSkyFieldSpawn = function(id)
+    for _, f in ipairs(flyers) do
+      if f.id == id then removeFlyer(f); return true end
+    end
+    return true
+  end
+
+  mod.exports.grantSharedSkyFieldContact = function(mapId, id)
+    local pending = pendingSharedClaim
+    if not (pending and pending.map == mapId and pending.id == id) then return false end
+    pendingSharedClaim = nil
+    local f = pending.flyer
+    if not f or f.dead then return false end
+    local hit = { id = f.id, species = f.species, level = f.level or 5,
+      altitude = f.alt or 0 }
+    removeFlyer(f)
+    battleRest = BATTLE_REST
+    local Game = require("src.core.Game")
+    local ow, started = Game and Game.overworld, false
+    if pending.airborne then
+      local ff = mod.find("free_fly")
+      local start = ff and ff.exports and ff.exports.startSharedSkyEncounter
+      if start then local ok, result = pcall(start, hit); started = ok and result == true end
+    end
+    if not started then
+      local db = mod.find("double_battles")
+      if db and db.exports and db.exports.tagOrganic then pcall(db.exports.tagOrganic) end
+      lastBump = { species = hit.species, level = hit.level,
+                   at = love.timer.getTime() }
+      pcall(function() require("src.core.Sound").playCry(Game.data, hit.species) end)
+      started = mod.world:queueScript({
+        { "start_battle", "wild", hit.species, hit.level },
+      }) == true
+    end
+    return started
+  end
+
+  mod.exports.denySharedSkyFieldContact = function(mapId, id)
+    if not (pendingSharedClaim and pendingSharedClaim.map == mapId
+       and pendingSharedClaim.id == id) then return false end
+    pendingSharedClaim = nil
+    return true
+  end
+
+  mod.exports.clearSharedSkyField = function()
+    local Game = require("src.core.Game")
+    clearAll(Game and Game.overworld)
+    sharedActive, sharedAuthority, sharedMap = false, false, nil
+    sharedRevision, pendingSharedClaim, cooldown = 0, nil, 3
+    sharedSnapshots, sharedGhostEntities = {}, {}
+    syncSharedSkyGhosts()
+    return true
+  end
+
   -- spawn one flyer on demand (scenario mods, tests): entry, height and
   -- behaviour roll as usual; the ambient caps and cooldowns are not
   -- consulted.  Returns the flyer id, or nil and a reason.
@@ -864,6 +1258,13 @@ return function(mod)
   local keepThroughSeam = false
 
   mod.events:on("map.exited", function()
+    if sharedActive then
+      local Game = require("src.core.Game")
+      clearAll(Game and Game.overworld)
+      sharedActive, sharedAuthority, sharedMap = false, false, nil
+      pendingSharedClaim, keepThroughSeam, cooldown = nil, false, 0
+      return
+    end
     if keepThroughSeam then
       keepThroughSeam = false
       return
@@ -883,15 +1284,31 @@ return function(mod)
 
     OC.__wildSkiesTick = function(ow, dt)
       if not (ow and ow.map and ow.player) then return end
+      if sharedMap ~= ow.map.id then
+        if #flyers > 0 then clearAll(ow) end
+        sharedActive, sharedAuthority, sharedMap = false, false, nil
+        local cached = sharedSnapshots[ow.map.id]
+        if cached then applyCurrentSharedSnapshot(cached) end
+      end
+      reconcileFlyerEntities(ow)
       dt = dt or 1 / 60
+      sharedGhostClock = sharedGhostClock + dt
+      if sharedGhostClock >= 0.5 then
+        sharedGhostClock = 0
+        syncSharedSkyGhosts()
+      end
       battleRest = math.max(0, battleRest - dt)
-      for i = #flyers, 1, -1 do
-        local f = flyers[i]
-        f:tick(ow, dt)
-        if f.dead then
-          if f.summonId then summonFail(f, "lost") end
-          detach(ow, f)
-          table.remove(flyers, i)
+      if sharedActive and not sharedAuthority then
+        tickSharedReplica(dt)
+      else
+        for i = #flyers, 1, -1 do
+          local f = flyers[i]
+          f:tick(ow, dt)
+          if f.dead then
+            if f.summonId then summonFail(f, "lost") end
+            detach(ow, f)
+            table.remove(flyers, i)
+          end
         end
       end
 
@@ -904,6 +1321,9 @@ return function(mod)
          and mod.options:get("bumps") then
         local f = flyerNear(p.cellX, p.cellY, 1)
         if f and (f.alt or 0) <= LOW_ALT then
+          if sharedActive then
+            if claimShared(f) then bumpCooldown = 2 end
+          else
           local db = mod.find("double_battles")
           if db and db.exports and db.exports.tagOrganic then
             pcall(db.exports.tagOrganic)
@@ -934,8 +1354,13 @@ return function(mod)
               })
             end)
           end
+          end
         end
       end
+
+      -- Replicas present canonical motion and may claim a collision, but only
+      -- the selected authority rolls new birds or advances their AI.
+      if sharedActive and not sharedAuthority then return end
 
       cooldown = cooldown - dt
       local d = density()
@@ -1120,12 +1545,16 @@ return function(mod)
     OC.__wildSkiesCarry = function(self, dir, conn, origCross)
       local p = self.player
       local beforeX, beforeY = p.px, p.py
-      keepThroughSeam = #flyers > 0
+      -- Solo skies retain their historical seam carry. Shared skies are
+      -- map-scoped and promote the already-rendered destination snapshot;
+      -- carrying the source flock would seed/reset the wrong map.
+      keepThroughSeam = not sharedActive and #flyers > 0
       local crossed = origCross(self, dir, conn)
       if not crossed then
         keepThroughSeam = false
         return crossed
       end
+      if sharedActive then return crossed end
       local dx, dy = p.px - beforeX, p.py - beforeY
       for _, f in ipairs(flyers) do
         f.px, f.py = f.px + dx, f.py + dy
