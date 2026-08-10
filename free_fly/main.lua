@@ -20,6 +20,13 @@ return function(mod)
       .. "in the gen1recomp-mods repo to sync shared code; mod disabled")
     return
   end
+  local function loadLib(file)
+    local src = assert(mod:read("lib/" .. file), "missing lib/" .. file)
+    return assert((loadstring or load)(src, "@free_fly/lib/" .. file))()
+  end
+  local FlightInput = loadLib("FlightInput.lua")
+  local VoxelProvider = loadLib("VoxelProvider.lua")
+  local ConvoyVisibility = loadLib("ConvoyVisibility.lua")
 
   local RISE_SPEED = 72       -- px/s takeoff and landing lerp
 
@@ -73,6 +80,73 @@ return function(mod)
 
   local function flying() return state.phase ~= "idle" end
 
+  -- Dramatic Shape's maintained/original build and the battle-art fork expose
+  -- the same public library seam under different mod ids.  Resolving only the
+  -- original id leaves movement permissive but drops every visual half of
+  -- flight under the fork: terrain height, lifted camera, first/third-person
+  -- movement and cockpit presentation.
+  local voxelLib = VoxelProvider.lib
+
+  -- Is a battle screen present NOW?
+  --
+  -- The old answer was an event latch.  That is sufficient for an ordinary
+  -- BattleState, whose enter/finish always emit a matched started/ended pair,
+  -- but a co-op mod can replace or hold that state and own a battle screen of
+  -- its own.  Seeing the ordinary start without its displaced finish leaves a
+  -- historical latch true forever: FREEFLY appears in a menu built just before
+  -- the event, refuses when selected, and then disappears from every later
+  -- menu.  The stack is the authority because it answers the question being
+  -- asked.  The latch remains a fallback for headless/older engines whose
+  -- stack does not expose its state list.
+  local function battleRunning(game)
+    local stack = game and game.stack
+    local screens = stack and stack.states
+    if type(screens) ~= "table" then return state.inBattle == true end
+    local ok, BattleState = pcall(require, "src.battle.BattleState")
+    for _, screen in ipairs(screens) do
+      if screen and (screen.isBattleScreen == true
+          or (ok and getmetatable(screen) == BattleState)) then
+        return true
+      end
+    end
+    -- A settled stack disproves a stale event latch.
+    return false
+  end
+
+  -- Capture the semantic B edge before Input:step drains pressQueue.  The
+  -- ordinary wasPressed edge remains the in-world fallback below, but this
+  -- boundary is authoritative for a short keyboard tap (X/Backspace), a pad
+  -- tap, and another mod's source-safe injected B alike.
+  mod.hooks:wrap("input.step", function(nextFn, game, dt)
+    local top = game and game.stack and game.stack:top()
+    FlightInput.capture(game and game.input,
+      flying() and top ~= nil and top.isOverworld == true,
+      function()
+        state.landRequest = true
+        mod.log:info("landing requested")
+      end)
+    local a, b, c, d = nextFn(game, dt)
+    -- The flight heartbeat used to wrap OverworldController.update directly.
+    -- Wilds legitimately reasserts its own controller wrapper at game.ready;
+    -- restoring the function it captured before Free Fly loaded could erase
+    -- ours without an error. input.step is the engine-owned, composable fixed-
+    -- step seam and cannot be displaced by another class monkey-patch.
+    top = game and game.stack and game.stack:top()
+    if top and top.isOverworld then
+      local okOC, OC = pcall(require, "src.world.OverworldController")
+      local tick = okOC and OC and OC.__freeFlyTick
+      if tick then
+        if flying() and not state.tickSeen then
+          state.tickSeen = true
+          mod.log:info("flight update active")
+        end
+        local ok, err = pcall(tick, top, dt)
+        if not ok then mod.log:error("flight update failed: %s", tostring(err)) end
+      end
+    end
+    return a, b, c, d
+  end, 1000)
+
   -- ------- public API
   -- Flight state for other mods; the takeoff/landed events below are
   -- the push-style counterpart.  Nothing here hands out internals.
@@ -83,11 +157,41 @@ return function(mod)
     if not mon then return nil end
     return { species = mon.species, level = mon.level }
   end
+  mod.exports.startSharedSkyEncounter = function(hit)
+    if not (flying() and type(hit) == "table" and hit.species) then return false end
+    local Game = require("src.core.Game")
+    state.interceptCooldown = 2
+    state.expectBattle = 4
+    state.lastIntercept = { species = hit.species, at = love.timer.getTime() }
+    pcall(function()
+      require("src.core.Sound").playCry(Game.data, hit.species)
+    end)
+    local db = mod.find("double_battles")
+    if db and db.exports and db.exports.tagOrganic then
+      pcall(db.exports.tagOrganic)
+    end
+    mod.log:info("intercepted shared %s!", tostring(hit.species))
+    return mod.world:queueScript({
+      { "start_battle", "wild", hit.species, hit.level or 5 },
+    }) == true
+  end
   -- sprite packs with in-air art can register a source (shared/README
   -- in the repo documents the shape); this reaches only THIS mod's
   -- bundled resolver, so packs register with each mod they dress
   mod.exports.registerSpriteSource = Sky.registerSpriteSource
   mod.exports.unregisterSpriteSource = Sky.unregisterSpriteSource
+
+  -- Wilds owns its six-member convoy and reconciles those trailer objects
+  -- after our fixed-step flight heartbeat.  Bridge at its exported control
+  -- seam so the owning system performs the final visibility decision.
+  mod.events:on("game.ready", function()
+    local wilds = mod.find("overworld_wild_spawns")
+    local follower = wilds and wilds.exports and wilds.exports.follower
+    local control = follower and follower.control
+    if ConvoyVisibility.installControlBridge(control, flying) then
+      mod.log:info("Wilds convoy flight visibility connected")
+    end
+  end)
 
   local function emitTakeoff(mon)
     pcall(function()
@@ -108,6 +212,18 @@ return function(mod)
     end)
   end
 
+  local function rebuildConvoyAfterLanding(game, ow)
+    local wilds = mod.find("overworld_wild_spawns")
+    local syncAll = wilds and wilds.exports and wilds.exports.syncAll
+    local ok, err = ConvoyVisibility.rebuildAndRestore(ow, function()
+      if type(syncAll) == "function" then syncAll(game, ow) end
+    end)
+    if not ok then
+      mod.log:warn("could not rebuild the follower convoy after landing: "
+        .. tostring(err))
+    end
+  end
+
   -- render pipelines (voxel, tilt) billboard every entity through pose();
   -- while flying the player's own card becomes the bird, and this ghost
   -- entity carries the player figure seated above it.  Invisible in the
@@ -125,8 +241,12 @@ return function(mod)
   function Rider:pose()
     local p = self.player
     local lift = math.floor((p.freeFlyAlt or 0) + 0.5)
+    -- Thick voxel characters need more clearance than flat billboards or the
+    -- mount's body hides the trainer completely.  This ghost exists only in
+    -- pipeline rendering; the flat path composes its own seated rider.
+    local clearance = 12
     -- always the WALKING sheet: while airborne p.sprite is the mount
-    return p.freeFlyWalkSprite or p.sprite, p.px, p.py - lift - 6,
+    return p.freeFlyWalkSprite or p.sprite, p.px, p.py - lift - clearance,
            p.facing, 0, false, false
   end
   function Rider:draw() end
@@ -202,7 +322,7 @@ return function(mod)
     if flying() then return end
     -- the last line of defense: no route into flight is legal in battle,
     -- however the caller got here
-    if state.inBattle then
+    if battleRunning(game) then
       mod.log:warn("takeoff refused: a battle is running")
       return
     end
@@ -290,7 +410,7 @@ return function(mod)
     if type(out) ~= "table" then return out end
     -- the battle switch menu also runs through this hook; taking off
     -- from there would unwind the battle screen itself
-    if (ctx and ctx.battle) or state.inBattle then return out end
+    if (ctx and ctx.battle) or battleRunning(game) then return out end
     local ow = ctx and ctx.overworld
     if not (ow and ow.map and ow.map.def) or flying() then return out end
     if not (eligibleFlyer(game, ow, mon) and badgeOk(game, mon)) then return out end
@@ -299,7 +419,7 @@ return function(mod)
     table.insert(out, 1, { label = "FREEFLY", onSelect = function(m, g)
       -- a stale entry (menu built before a battle started) must not
       -- unwind the battle screen below it
-      if state.inBattle then return end
+      if battleRunning(g) then return end
       -- unwind party menu / start menu back to the overworld, then lift off
       local stack = g.stack
       while stack:top() and not stack:top().isOverworld do stack:pop() end
@@ -490,8 +610,7 @@ return function(mod)
       -- resolved once, not per frame
       if state.fpRef == nil then
         state.fpRef = false
-        local exports = game.mods and game.mods.exports
-        local V = exports and exports.DRAMATIC_SHAPE and exports.DRAMATIC_SHAPE.lib
+        local V = voxelLib(game)
         local okFP, fp = pcall(function() return V and V.require("FirstPerson") end)
         if okFP and fp then state.fpRef = fp end
       end
@@ -503,7 +622,7 @@ return function(mod)
         if not hudLogged then
           hudLogged = true
           mod.log:info("cockpit idle (%s)",
-            not FP and "no DRAMATIC_SHAPE lib"
+            not FP and "no compatible voxel lib"
             or not FP.hidePlayer and "no hidePlayer api" or "card visible")
         end
         return
@@ -578,8 +697,7 @@ return function(mod)
     local function tileHeightAt(map, cx, cy)
       if tileShape == nil then
         tileShape = false
-        local exports = Game.mods and Game.mods.exports
-        local V = exports and exports.DRAMATIC_SHAPE and exports.DRAMATIC_SHAPE.lib
+        local V = voxelLib(Game)
         if V and V.require then
           local ok, ts = pcall(V.require, "TileShape")
           if ok and ts and ts.forMap then tileShape = ts end
@@ -730,8 +848,7 @@ return function(mod)
     local function mesherBusy()
       if state.mesherRef == nil then
         state.mesherRef = false
-        local exports = Game.mods and Game.mods.exports
-        local V = exports and exports.DRAMATIC_SHAPE and exports.DRAMATIC_SHAPE.lib
+        local V = voxelLib(Game)
         local ok, cm = pcall(function() return V and V.require("ChunkMesher") end)
         if ok and cm and cm.pending then state.mesherRef = cm end
       end
@@ -756,7 +873,7 @@ return function(mod)
     -- same gates as the FREEFLY menu entry.  Returns ok, failure text.
     local function partnerTakeoff(ow)
       local save = Game.save
-      if state.inBattle then
+      if battleRunning(Game) then
         return false, "This isn't the\ntime to use that!"
       end
       if not (save and ow.map and ow.map.def) then
@@ -1132,6 +1249,7 @@ return function(mod)
         state.landmark = ok and lm or { mapId = ow.map.id, w = 1, cells = {} }
       end
       if not flying() then
+        ConvoyVisibility.restore(ow)
         if p.freeFlyAlt then p.freeFlyAlt, p.freeFlying = nil, nil end
         if p.freeFlyWalkSprite then
           p.sprite, p.freeFlyWalkSprite = p.freeFlyWalkSprite, nil
@@ -1144,6 +1262,11 @@ return function(mod)
         return
       end
       p.freeFlying = true
+      -- Wilds' six-member convoy is a separate trailer system rather than
+      -- the engine's single Pikachu follower.  Keep its authoritative trail
+      -- objects alive, but take them out of the render/update lists while the
+      -- trainer is airborne; landing restores those same objects in place.
+      ConvoyVisibility.hide(ow)
       -- the mount IS the player's sheet while airborne, so every renderer
       -- (voxel first/third person frame remaps included) shows it; the
       -- walking sheet is stashed for the rider overlay and the landing
@@ -1232,6 +1355,7 @@ return function(mod)
             if p.freeFlyWalkSprite then
               p.sprite, p.freeFlyWalkSprite = p.freeFlyWalkSprite, nil
             end
+            rebuildConvoyAfterLanding(Game, ow)
             emitLanded("landed", p)
             return
           end
@@ -1281,23 +1405,7 @@ return function(mod)
           if take then
             local ok, hit = pcall(take, p.cellX, p.cellY, 1)
             if ok and hit and hit.species then
-              state.interceptCooldown = 2
-              state.expectBattle = 4
-              pcall(function()
-                require("src.core.Sound").playCry(Game.data, hit.species)
-              end)
-              mod.log:info("intercepted %s!", tostring(hit.species))
-              -- the flock partner source keys off this record: the
-              -- battle about to start may recruit a second bird
-              state.lastIntercept = { species = hit.species,
-                                      at = love.timer.getTime() }
-              local db = mod.find("double_battles")
-              if db and db.exports and db.exports.tagOrganic then
-                pcall(db.exports.tagOrganic)
-              end
-              mod.world:queueScript({
-                { "start_battle", "wild", hit.species, hit.level or 5 },
-              })
+              mod.exports.startSharedSkyEncounter(hit)
             end
           end
         end
@@ -1382,9 +1490,7 @@ return function(mod)
         local rung = Pipelines.level("voxel") or 0
         if state.voxelStateRef == nil then
           state.voxelStateRef = false
-          local exports = Game.mods and Game.mods.exports
-          local V = exports and exports.DRAMATIC_SHAPE
-            and exports.DRAMATIC_SHAPE.lib
+          local V = voxelLib(Game)
           local okV, vs = pcall(function()
             return V and V.require("VoxelState")
           end)
@@ -1414,9 +1520,7 @@ return function(mod)
       local vsRef = state.voxelStateRef
       if state.v3dRef == nil then
         state.v3dRef = false
-        local exports = Game.mods and Game.mods.exports
-        local V = exports and exports.DRAMATIC_SHAPE
-          and exports.DRAMATIC_SHAPE.lib
+        local V = voxelLib(Game)
         local okV3, v3 = pcall(function()
           return V and V.require("Voxel3D")
         end)
@@ -1450,15 +1554,6 @@ return function(mod)
 
     if not OC.__freeFlyWrapped then
       OC.__freeFlyWrapped = true
-
-      local origUpdate = OC.update
-      OC.update = function(self, dt)
-        origUpdate(self, dt)
-        if OC.__freeFlyTick then
-          local ok, err = pcall(OC.__freeFlyTick, self, dt)
-          if not ok then print("[free_fly] tick failed: " .. tostring(err)) end
-        end
-      end
 
       -- doors and edge warps must not swallow a bird passing over them
       local origTakeWarp = OC.takeWarp
@@ -1577,8 +1672,7 @@ return function(mod)
     local TileRenderer = require("src.render.TileRenderer")
     TileRenderer.__freeFlySkip = nil
     pcall(function()
-      local exports = Game.mods and Game.mods.exports
-      local V = exports and exports.DRAMATIC_SHAPE and exports.DRAMATIC_SHAPE.lib
+      local V = voxelLib(Game)
       local CM = V and V.require("ChunkMesher")
       if CM then CM.__freeFlyBodyOnly = nil end
     end)
@@ -1891,8 +1985,7 @@ return function(mod)
     -- reaches it.  Wrapping its tick opens a permissive window scoped to
     -- exactly that call while the player flies.
     do
-      local exports = Game.mods and Game.mods.exports
-      local V = exports and exports.DRAMATIC_SHAPE and exports.DRAMATIC_SHAPE.lib
+      local V = voxelLib(Game)
       local okFM, FreeMove = pcall(function() return V and V.require("FreeMove") end)
       if okFM and FreeMove and FreeMove.tick then
         if not MapMod.__freeFlyWalkWrapped then
