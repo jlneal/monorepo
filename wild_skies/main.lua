@@ -112,6 +112,12 @@ return function(mod)
   for _, u in ipairs(ULTRA_RARES) do ULTRA_SET[u.species] = true end
 
   local flyers = {}
+  -- Seam-neighbor maps are already resident in the engine and visible through
+  -- ow.ghosts. Keep one local flock per resident map so a connection crossing
+  -- promotes the birds the player could already see instead of rerolling the
+  -- destination or translating the source flock into it.
+  local residentFields, residentGhosts = {}, {}
+  local residentGhostClock, residentGhostDt = 0, 1 / 60
   local battleRest = 0
   local lastBump = nil
   local summonFail -- forward: every summon ends in exactly one event
@@ -445,6 +451,7 @@ return function(mod)
     serial = serial + 1
     local self = setmetatable({}, Flyer)
     self.id = "wild_skies_" .. serial
+    self.wildSkiesFlyer = true
     self.sprite = sprite
     self.species = pick.species
     self.level = pick.level or love.math.random(3, 10)
@@ -833,6 +840,198 @@ return function(mod)
            flapPhase(self), false, false
   end
 
+  local function isTownMap(mapId)
+    local id = tostring(mapId or "")
+    return id:find("_TOWN", 1, true) ~= nil
+      or id:find("_CITY", 1, true) ~= nil
+      or id:find("_ISLAND", 1, true) ~= nil
+      or id:find("_PLATEAU", 1, true) ~= nil
+  end
+
+  local function residentPicks(game, map, tod)
+    if not (game and game.data and map and map.id) then
+      return {}, false, false
+    end
+    local MapDef = require("src.world.Map")
+    local FieldDefaults = require("src.world.FieldDefaults")
+    local def = map.def
+    local forest = def and def.tileset == "FOREST" or false
+    local outside = def and (forest or MapDef.isOutside(def,
+      FieldDefaults.field(game.data, "outsideTilesets"))) or false
+    local effectiveTod = outside and tod or "NITE"
+    local picks = flyingSlots(game, map.id, effectiveTod)
+    local town = outside and isTownMap(map.id) or false
+    local encDef = game.data.encounters and game.data.encounters[map.id]
+    if #picks == 0 and def and outside and (encDef or town) then
+      local sea = not town and encDef and encDef.water ~= nil
+        and not (encDef.grass and encDef.grass.slots
+                 and #encDef.grass.slots > 0)
+      local pool = tod == "NITE" and AMBIENT_NITE
+        or sea and AMBIENT_SEA or AMBIENT_DAY
+      for _, species in ipairs(pool) do
+        picks[#picks + 1] = { species = species }
+      end
+    end
+    return picks, forest, town
+  end
+
+  local function seedResidentField(game, ow, neighbor)
+    local map = neighbor and neighbor.map
+    if not (map and map.id) then return nil end
+    if residentFields[map.id] then return residentFields[map.id] end
+    local picks, forest, town = residentPicks(game, map, ow.tod or "DAY")
+    local field = { map = map, flyers = {} }
+    residentFields[map.id] = field
+    if #picks == 0 then return field end
+
+    local d = density()
+    local count = math.max(1, math.min(forest and 1 or d.cap, 3))
+    local ox, oy = tonumber(neighbor.ox) or 0, tonumber(neighbor.oy) or 0
+    local fake = {
+      map = map, entities = {}, npcs = {}, ghosts = {}, neighbors = {},
+      tod = ow.tod,
+      camera = { x = (ow.camera and ow.camera.x or 0) - ox,
+                 y = (ow.camera and ow.camera.y or 0) - oy },
+      player = {
+        px = (ow.player.px or ow.player.cellX * 16) - ox,
+        py = (ow.player.py or ow.player.cellY * 16) - oy,
+      },
+    }
+    fake.player.cellX = math.floor((fake.player.px + 8) / 16)
+    fake.player.cellY = math.floor((fake.player.py + 8) / 16)
+
+    local oldPeaceful = picksCache.peaceful
+    picksCache.peaceful = town
+    local attempts = 0
+    while #field.flyers < count and attempts < count * 6 do
+      attempts = attempts + 1
+      local pick = picks[love.math.random(#picks)]
+      local f = Flyer.new(game, fake, pick)
+      if f then
+        if forest then
+          f.band = { 10, 16 }
+          f.altTarget, f.alt = math.min(f.altTarget, 16), math.min(f.alt, 16)
+        end
+        if town then f.bold = false end
+        field.flyers[#field.flyers + 1] = f
+        fake.entities[#fake.entities + 1] = f
+      end
+    end
+    picksCache.peaceful = oldPeaceful
+    return field
+  end
+
+  local function storeResidentField(map)
+    if not (map and map.id) then return end
+    residentFields[map.id] = { map = map, flyers = flyers }
+    local prefix = tostring(map.id) .. ":"
+    for key in pairs(residentGhosts) do
+      if key:sub(1, #prefix) == prefix then residentGhosts[key] = nil end
+    end
+  end
+
+  local function newResidentGhost(mapId, f)
+    local ghost = setmetatable({
+      id = f.id, sprite = f.sprite, species = f.species, level = f.level,
+      wildSkiesFlyer = true, wildSkiesResidentGhost = true, passable = true,
+      bobAmp = f.bobAmp, scale = f.scale, scaleCap = f.scaleCap,
+      flap = f.flap, bold = f.bold, px = f.px, py = f.py, alt = f.alt,
+      facing = f.facing, mode = f.mode, perchAlt = f.perchAlt, t = f.t or 0,
+      vx = f.vx or 0, vy = f.vy or 0,
+      mapW = f.mapW, mapH = f.mapH,
+    }, Flyer)
+    ghost.update = function(self)
+      local dt = residentGhostDt
+      self.t = (self.t or 0) + dt
+      if self.mode ~= "ground" then
+        local maxX = math.max(0, (self.mapW or 16) - 16)
+        local maxY = math.max(0, (self.mapH or 16) - 16)
+        self.px = self.px + (self.vx or 0) * dt
+        self.py = self.py + (self.vy or 0) * dt
+        if self.px <= 0 or self.px >= maxX then
+          self.px = math.max(0, math.min(maxX, self.px))
+          self.vx = -(self.vx or 0)
+        end
+        if self.py <= 0 or self.py >= maxY then
+          self.py = math.max(0, math.min(maxY, self.py))
+          self.vy = -(self.vy or 0)
+        end
+        local ax, ay = math.abs(self.vx or 0), math.abs(self.vy or 0)
+        if ax >= ay then
+          self.facing = (self.vx or 0) < 0 and "left" or "right"
+        else
+          self.facing = (self.vy or 0) < 0 and "up" or "down"
+        end
+      end
+      self.cellX = math.floor((self.px + 8) / 16)
+      self.cellY = math.floor((self.py + 8) / 16)
+    end
+    residentGhosts[tostring(mapId) .. ":" .. tostring(f.id)] = ghost
+    return ghost
+  end
+
+  local function syncResidentGhosts(game, ow)
+    if not (ow and type(ow.neighbors) == "table"
+       and type(ow.ghosts) == "table") then return end
+    for i = #ow.ghosts, 1, -1 do
+      if ow.ghosts[i].wildSkiesResidentGhost then table.remove(ow.ghosts, i) end
+    end
+    local live, residentMaps = {}, {}
+    if ow.map and ow.map.id then residentMaps[ow.map.id] = true end
+    for _, neighbor in ipairs(ow.neighbors) do
+      local map = neighbor.map
+      if map and map.id then residentMaps[map.id] = true end
+      local field = map and seedResidentField(game, ow, neighbor)
+      local peers, entries = {}, {}
+      for _, f in ipairs((field and field.flyers) or {}) do
+        if not f.dead then
+          local key = tostring(map.id) .. ":" .. tostring(f.id)
+          live[key] = true
+          local ghost = residentGhosts[key] or newResidentGhost(map.id, f)
+          peers[#peers + 1], entries[#entries + 1] = ghost, ghost
+        end
+      end
+      for _, ghost in ipairs(entries) do
+        ow.ghosts[#ow.ghosts + 1] = {
+          npc = ghost, map = map, ox = neighbor.ox, oy = neighbor.oy,
+          peers = peers, wildSkiesResidentGhost = true,
+        }
+      end
+    end
+    for key in pairs(residentGhosts) do
+      if not live[key] then residentGhosts[key] = nil end
+    end
+    for mapId in pairs(residentFields) do
+      if not residentMaps[mapId] then residentFields[mapId] = nil end
+    end
+  end
+
+  local function activateResidentField(game, ow, field)
+    if not (ow and field) then return false end
+    flyers = field.flyers or {}
+    for i = #ow.entities, 1, -1 do
+      if ow.entities[i].wildSkiesFlyer then table.remove(ow.entities, i) end
+    end
+    for _, f in ipairs(flyers) do
+      if not f.dead then
+        local ghost = residentGhosts[tostring(field.map.id) .. ":" .. tostring(f.id)]
+        if ghost then
+          f.px, f.py, f.alt = ghost.px, ghost.py, ghost.alt
+          f.vx, f.vy, f.facing = ghost.vx, ghost.vy, ghost.facing
+          f.speed = math.sqrt((f.vx or 0) ^ 2 + (f.vy or 0) ^ 2)
+          if f.speed > 0 then f.heading = math.atan2(f.vy, f.vx) end
+        end
+        f.mapW = ((ow.map.widthCells or (ow.map.width or 10) * 2)) * 16
+        f.mapH = ((ow.map.heightCells or (ow.map.height or 9) * 2)) * 16
+        f.cellX = math.floor((f.px + 8) / 16)
+        f.cellY = math.floor((f.py + 8) / 16)
+        ow.entities[#ow.entities + 1] = f
+      end
+    end
+    syncResidentGhosts(game, ow)
+    return true
+  end
+
   -- spawn one flyer on demand (scenario mods, tests): entry, height and
   -- behaviour roll as usual; the ambient caps and cooldowns are not
   -- consulted.  Returns the flyer id, or nil and a reason.
@@ -870,7 +1069,20 @@ return function(mod)
     end
     local Game = require("src.core.Game")
     clearAll(Game and Game.overworld)
+    local ow = Game and Game.overworld
+    if ow and ow.ghosts then
+      for i = #ow.ghosts, 1, -1 do
+        if ow.ghosts[i].wildSkiesResidentGhost then table.remove(ow.ghosts, i) end
+      end
+    end
+    residentFields, residentGhosts = {}, {}
     cooldown = 3
+  end)
+
+  mod.events:on("map.entered", function()
+    local Game = require("src.core.Game")
+    local ow = Game and Game.overworld
+    if ow then syncResidentGhosts(Game, ow) end
   end)
 
   mod.events:on("game.ready", function()
@@ -884,6 +1096,12 @@ return function(mod)
     local function skyTick(ow, dt)
       if not (ow and ow.map and ow.player) then return end
       dt = dt or 1 / 60
+      residentGhostDt = dt
+      residentGhostClock = residentGhostClock + dt
+      if residentGhostClock >= 0.5 then
+        residentGhostClock = 0
+        syncResidentGhosts(Game, ow)
+      end
       battleRest = math.max(0, battleRest - dt)
       for i = #flyers, 1, -1 do
         local f = flyers[i]
@@ -1100,10 +1318,14 @@ return function(mod)
       return skyTick(ow, dt)
     end
     Sky.ensureUpdateWrap(OC, "__wildSkiesTick", mod.hooks)
+    -- Populate the already-resident view on the first ready frame as well;
+    -- the periodic refresh below is for movement and newly loaded neighbors,
+    -- not the initial reveal.
+    syncResidentGhosts(Game, Game and Game.overworld)
 
-    -- birds survive seamless connection crossings: translate them by the
-    -- same coordinate rebase the player gets, and re-attach them to the
-    -- rebuilt entity list.  Out-of-bounds ones despawn naturally.
+    -- Keep a distinct population for every engine-resident seam map. The
+    -- destination flock is already visible through ow.ghosts and becomes the
+    -- live flock without a reroll or position jump when the player crosses.
     if not OC.__wildSkiesSeamWrapped then
       OC.__wildSkiesSeamWrapped = true
       local origCross = OC.crossConnection
@@ -1114,24 +1336,26 @@ return function(mod)
       end
     end
     OC.__wildSkiesCarry = function(self, dir, conn, origCross)
-      local p = self.player
-      local beforeX, beforeY = p.px, p.py
-      keepThroughSeam = #flyers > 0
+      local sourceMap = self.map
+      storeResidentField(sourceMap)
+      -- Even an empty current sky may have a populated destination already
+      -- visible through the seam; preserve the resident cache unconditionally.
+      keepThroughSeam = true
       local crossed = origCross(self, dir, conn)
+      keepThroughSeam = false
       if not crossed then
-        keepThroughSeam = false
         return crossed
       end
-      local dx, dy = p.px - beforeX, p.py - beforeY
-      for _, f in ipairs(flyers) do
-        f.px, f.py = f.px + dx, f.py + dy
-        if f.landX then f.landX, f.landY = f.landX + dx, f.landY + dy end
-        f.cellX = math.floor((f.px + 8) / 16)
-        f.cellY = math.floor((f.py + 8) / 16)
-        f.mapW = ((self.map.widthCells or (self.map.width or 10) * 2)) * 16
-        f.mapH = ((self.map.heightCells or (self.map.height or 9) * 2)) * 16
-        table.insert(self.entities, f)
+      local destination = self.map and residentFields[self.map.id]
+      if not destination then
+        destination = { map = self.map, flyers = {} }
+        residentFields[self.map.id] = destination
       end
+      activateResidentField(Game, self, destination)
+      for _, neighbor in ipairs(self.neighbors or {}) do
+        seedResidentField(Game, self, neighbor)
+      end
+      syncResidentGhosts(Game, self)
       return crossed
     end
   end)

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Seam-neighbor skies are pre-populated on the engine's ghost surface and
+  retain their displayed positions when promoted to the current map. Each
+  connected outdoor map keeps its own bounded resident flock; doors and other
+  full transitions still refresh the population.
+
 ## 1.6.3
 
 - The GROUND BUMPS option is now called GROUND BATTLES. Same toggle,
