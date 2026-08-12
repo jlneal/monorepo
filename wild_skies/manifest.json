@@ -7,7 +7,7 @@
   "category": "MECHANIC",
   "priority": 110,
   "dependencies": [],
-  "optional_dependencies": ["CRYSTAL_251"],
+  "optional_dependencies": ["CRYSTAL_251", "rby_shared_campaign"],
   "conflicts": [],
   "permissions": [
     "engine_internals"

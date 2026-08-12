@@ -23,6 +23,9 @@ return function(mod)
       .. "in the gen1recomp-mods repo to sync shared code; mod disabled")
     return
   end
+  local CampaignAdmission = assert((loadstring or load)(
+    assert(mod:read("lib/campaign_admission.lua")),
+    "@wild_skies/lib/campaign_admission.lua"))()
 
   mod.options:define({
     { key = "density", label = "SKY DENSITY", type = "choice", default = "med",
@@ -287,6 +290,7 @@ return function(mod)
     local f = flyerNear(cellX, cellY, radius)
     if not f then return nil end
     if sharedActive then requestSharedContact(f); return nil end
+    if not CampaignAdmission.admit(mod, "sky") then return nil end
     local Game = require("src.core.Game")
     f.dead = true
     detach(Game and Game.overworld, f)
@@ -406,6 +410,7 @@ return function(mod)
             if not pick then pick, pickIndex = f, i end
           end
         end
+        if pick and not CampaignAdmission.admit(mod, "random") then return nil end
         if pick then
           enc.level = pick.level or enc.level
           pick.dead = true
@@ -1461,6 +1466,7 @@ return function(mod)
   requestSharedContact = function(f)
     if not (sharedActive and sharedProvider and f and not pendingSharedClaim)
        or type(sharedProvider.requestClaim) ~= "function" then return false end
+    if not CampaignAdmission.admit(mod, "sky") then return false end
     local Game = require("src.core.Game")
     local mapId = Game and Game.overworld and Game.overworld.map
       and Game.overworld.map.id
@@ -1739,6 +1745,7 @@ return function(mod)
             if requestSharedContact(f) then bumpCooldown = 2 end
             return
           end
+          if not CampaignAdmission.admit(mod, "sky") then return end
           local db = mod.find("double_battles")
           if db and db.exports and db.exports.tagOrganic then
             pcall(db.exports.tagOrganic)
